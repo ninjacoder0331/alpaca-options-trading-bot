@@ -236,6 +236,7 @@ def sell_order():
         "status": "open"
     })
     
+    
     if order is None:
         return jsonify({
             "message": "No open order found for the given symbol and strategy",
@@ -243,6 +244,7 @@ def sell_order():
         }), 404
 
     optionSymbol = order["optionSymbol"]
+    openTradingID = order["tradingId"]
     print("order: ", order["optionSymbol"])
 
     url = "https://paper-api.alpaca.markets/v2/positions/" + optionSymbol
@@ -272,11 +274,12 @@ def sell_order():
 
         filled_price = response.json()['filled_avg_price']
         exitTimestamp = response.json()['filled_at']
+        print("openTradingID" , openTradingID)
 
         db.orders.update_one({
-            "tradingId": tradingId
+            "tradingId": openTradingID
         }, {
-            "$set": {"status": "closed", "exitPrice": filled_price, "exitTimestamp": exitTimestamp}
+            "$set": {"status": "closed"}
         })
     else:
         return jsonify({
