@@ -115,6 +115,20 @@ def get_option_symbol(symbol, side, price):
     else:
         return None
 
+def get_option_details(optionSymbol):
+    url = "https://data.alpaca.markets/v1beta1/options/snapshots?symbols=" + optionSymbol + "&feed=indicative&limit=100"
+
+    headers = {
+        "accept": "application/json",
+        "APCA-API-KEY-ID": "PKYTF6XTW8ZDKWMIG3P7",
+        "APCA-API-SECRET-KEY": "sKrOobmPUzxYZOJ38Pcq0r4bYxaOlOcmegZVBVcm"
+    }
+
+    response = requests.get(url, headers=headers)
+
+    print(response.text)
+    return response.json()
+
 @app.route('/api/buyOrder', methods=['POST'])
 def buy_order():
     data = request.get_json()
@@ -122,38 +136,85 @@ def buy_order():
     side = data['side']
     strategyName = data['strategyName']
     price = data['price']
+    quantity = data['quantity']
 
     api_key = os.getenv('API_KEY')
     api_secret = os.getenv('SECREAT_KEY')
+    # Convert price to float for calculations
+    price_num = float(price)
+    
+    optionSymbol1 = get_option_symbol(symbol, side, price)
+    optionDetails1 = get_option_details(optionSymbol1)
+    optionDelta1 = optionDetails1['snapshots'][optionSymbol1]['greeks']['delta']
 
-    optionSymbol = get_option_symbol(symbol, side, price)
-    print("optionSymbol: ", optionSymbol)
+    optionSymbol2 = get_option_symbol(symbol, side, str(price_num + 1))
+    optionDetails2 = get_option_details(optionSymbol2)
+    optionDelta2 = optionDetails2['snapshots'][optionSymbol2]['greeks']['delta']
 
-    db.orders.insert_one({
-        "symbol": symbol,
-        "side": side,
-        "strategyName": strategyName,
-        "price": price,
-        "optionSymbol": optionSymbol,
-    })
+    optionSymbol3 = get_option_symbol(symbol, side, str(price_num - 1))
+    optionDetails3 = get_option_details(optionSymbol3)
+    optionDelta3 = optionDetails3['snapshots'][optionSymbol3]['greeks']['delta']
+
+    # Find the delta closest to 0.5
+    deltas = [
+        (abs(optionDelta1 - 0.5), optionDelta1, optionSymbol1),
+        (abs(optionDelta2 - 0.5), optionDelta2, optionSymbol2),
+        (abs(optionDelta3 - 0.5), optionDelta3, optionSymbol3)
+    ]
+    # Sort by absolute difference from 0.5
+    deltas.sort()
+    # Get the option symbol with delta closest to 0.5
+    selected_delta = deltas[0][1]
+    selected_symbol = deltas[0][2]
+    
+    print("Selected delta closest to 0.5: ", selected_delta)
+    print("Selected option symbol: ", selected_symbol)
 
     payload = {
         "type": "market",
         "time_in_force": "day",
-        "symbol": optionSymbol,
-        "qty": "2",
-        "side": side
+        "symbol": selected_symbol,
+        "qty": quantity,
+        "side": side,
     }
     headers = {
-    "accept": "application/json",
-    "content-type": "application/json",
+        "accept": "application/json",
+        "content-type": "application/json",
         "APCA-API-KEY-ID": api_key,
         "APCA-API-SECRET-KEY": api_secret
     }
     url = "https://paper-api.alpaca.markets/v2/orders"
     response = requests.post(url, json=payload, headers=headers)
-    print("response: ", response.json())
-    time.sleep(2)
+    tradingId = response.json()["id"]
+    print("response:", response.json())
+
+    if response.status_code == 200:
+        time.sleep(2)
+        url = "https://paper-api.alpaca.markets/v2/orders/" + tradingId
+        headers = {
+            "accept": "application/json",
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret
+        }
+        response = requests.get(url, headers=headers)
+        print("response: ", response.json())
+
+        filled_price = response.json()['filled_avg_price']
+        db.orders.insert_one({
+            "symbol": symbol,
+            "optionSymbol": selected_symbol,
+            "side": side,
+            "strategyName": strategyName,
+            "entryPrice": filled_price,
+            "entryTimestamp": response.json()['filled_at'],
+            "status" : "open",
+            "tradingId": tradingId
+        })
+    else:
+        return jsonify({
+            "message": "Buy order failed",
+            "status": "error"
+        }), 400
 
     return jsonify({
         "message": "Buy order received successfully",
@@ -169,17 +230,59 @@ def sell_order():
     strategyName = data['strategyName']
     price = data['price']
 
+    order = db.orders.find_one({
+        "symbol": symbol,
+        "strategyName": strategyName,
+        "status": "open"
+    })
+    
+    if order is None:
+        return jsonify({
+            "message": "No open order found for the given symbol and strategy",
+            "status": "error"
+        }), 404
+
+    optionSymbol = order["optionSymbol"]
+    print("order: ", order["optionSymbol"])
+
+    url = "https://paper-api.alpaca.markets/v2/positions/" + optionSymbol
+
     api_key = os.getenv('API_KEY')
     api_secret = os.getenv('SECREAT_KEY')
 
-    url = "https://paper-api.alpaca.markets/v2/positions"
     headers = {
         "accept": "application/json",
         "APCA-API-KEY-ID": api_key,
         "APCA-API-SECRET-KEY": api_secret
     }
     response = requests.delete(url, headers=headers)
-    print("response: ", response.json())
+    tradingId = response.json()["id"]
+    print("response:", response.json())
+
+    if response.status_code == 200:
+        time.sleep(2)
+        url = "https://paper-api.alpaca.markets/v2/orders/" + tradingId
+        headers = {
+            "accept": "application/json",
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret
+        }
+        response = requests.get(url, headers=headers)
+        print("response: ", response.json())
+
+        filled_price = response.json()['filled_avg_price']
+        exitTimestamp = response.json()['filled_at']
+
+        db.orders.update_one({
+            "tradingId": tradingId
+        }, {
+            "$set": {"status": "closed", "exitPrice": filled_price, "exitTimestamp": exitTimestamp}
+        })
+    else:
+        return jsonify({
+            "message": "Sell order failed",
+            "status": "error"
+        }), 400
 
     return jsonify({
         "message": "Sell order received successfully",
